@@ -324,9 +324,13 @@ def parse_vevent(component: IEvent, calendar_label: str) -> DigestEvent | None:
 
 def _parse_google_event(item: dict[str, Any], calendar_label: str) -> DigestEvent | None:
     try:
+        if item.get("status") == "cancelled":
+            return None
         title = item.get("summary", "(no title)")
         location = item.get("location", "")
         start_info = item.get("start", {})
+        if not start_info:
+            return None
         end_info = item.get("end", {})
         if "date" in start_info:
             start_d = date.fromisoformat(start_info["date"])
@@ -441,6 +445,7 @@ def fetch_google_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
                 if not page_token:
                     break
 
+        events.sort(key=lambda e: (e.start, e.end, e.title))
         return events
     except Exception as e:  # noqa: BLE001
         LOG.error("Google Calendar fetch failed: %s", e)
