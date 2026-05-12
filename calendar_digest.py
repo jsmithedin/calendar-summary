@@ -65,28 +65,25 @@ def _load_google() -> tuple[Any, Any]:
     return _google_bundle
 
 
-def _google_calendar_service(cfg: dict[str, Any]) -> Any:
-    build, service_account = _load_google()
+def _google_creds(cfg: dict[str, Any], scope: str) -> Any:
+    _, service_account = _load_google()
     g = cfg["google"]
     sa_path = Path(g["service_account_file"])
     if not sa_path.is_absolute():
         sa_path = SCRIPT_DIR / sa_path
-    creds = service_account.Credentials.from_service_account_file(
-        str(sa_path), scopes=[_GOOGLE_CAL_SCOPE]
+    return service_account.Credentials.from_service_account_file(
+        str(sa_path), scopes=[scope]
     ).with_subject(g["impersonate"])
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def _google_calendar_service(cfg: dict[str, Any]) -> Any:
+    build, _ = _load_google()
+    return build("calendar", "v3", credentials=_google_creds(cfg, _GOOGLE_CAL_SCOPE), cache_discovery=False)
 
 
 def _google_gmail_service(cfg: dict[str, Any]) -> Any:
-    build, service_account = _load_google()
-    g = cfg["google"]
-    sa_path = Path(g["service_account_file"])
-    if not sa_path.is_absolute():
-        sa_path = SCRIPT_DIR / sa_path
-    creds = service_account.Credentials.from_service_account_file(
-        str(sa_path), scopes=[_GOOGLE_GMAIL_SCOPE]
-    ).with_subject(g["impersonate"])
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    build, _ = _load_google()
+    return build("gmail", "v1", credentials=_google_creds(cfg, _GOOGLE_GMAIL_SCOPE), cache_discovery=False)
 
 
 def _stderr_progress(msg: str, t0: float) -> None:
@@ -945,6 +942,13 @@ def render_html(
 
 
 def send_html_email(cfg: dict[str, Any], subject: str, html: str) -> None:
+    if cfg.get("google"):
+        _send_gmail_api(cfg, subject, html)
+    else:
+        _send_smtp(cfg, subject, html)
+
+
+def _send_smtp(cfg: dict[str, Any], subject: str, html: str) -> None:
     smtp_cfg = cfg["smtp"]
     em = cfg["email"]
     msg = MIMEMultipart("alternative")
@@ -956,6 +960,19 @@ def send_html_email(cfg: dict[str, Any], subject: str, html: str) -> None:
         s.starttls()
         s.login(smtp_cfg["username"], smtp_cfg["password"])
         s.sendmail(em["from"], [em["to"]], msg.as_string())
+
+
+def _send_gmail_api(cfg: dict[str, Any], subject: str, html: str) -> None:
+    import base64
+    em = cfg["email"]
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = em["from"]
+    msg["To"] = em["to"]
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    svc = _google_gmail_service(cfg)
+    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def subject_for(week_start: datetime, include_month: bool) -> str:
