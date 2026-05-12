@@ -970,10 +970,18 @@ def run_digest(cfg: dict[str, Any], preview: bool) -> None:
     week_start, week_end = week_bounds_utc(now)
     first_sun = is_first_sunday(now.astimezone(DISPLAY_TZ))
 
-    week_events = fetch_icloud_events(cfg, week_start, week_end)
+    week_events = (
+        fetch_icloud_events(cfg, week_start, week_end)
+        + fetch_google_events(cfg, week_start, week_end)
+    )
+    week_events.sort(key=lambda e: (e.start, e.end, e.title))
     month_events: list[DigestEvent] = []
     if first_sun:
-        month_events = fetch_icloud_events(cfg, week_end, week_end + timedelta(days=30))
+        month_events = (
+            fetch_icloud_events(cfg, week_end, week_end + timedelta(days=30))
+            + fetch_google_events(cfg, week_end, week_end + timedelta(days=30))
+        )
+        month_events.sort(key=lambda e: (e.start, e.end, e.title))
 
     travel_cfg = cfg.get("travel") or {}
     travel_on = travel_cfg.get("enabled", True)
