@@ -8,7 +8,8 @@ Weekly iCloud (CalDAV) digest with an optional Anthropic-powered briefing, Open-
 2. Clone this repo and `cd` into it.
 3. Gather the [credentials](#required-credentials) below, then `cp config.example.json config.json` and fill in every field that applies.
 4. `chmod 600 config.json`
-5. `uv run calendar_digest.py --list-calendars` to discover exact iCloud calendar names (case-sensitive) and update `icloud.calendars` keys to match.
+5. `uv run calendar_digest.py --list-calendars` to discover exact iCloud calendar names (case-sensitive) and update `icloud.calendars` keys to match.  
+   **Timing:** the first run in a new clone often spends **15–45 seconds** loading Python’s CalDAV/XML stack before you see anything else; after that, a successful list is usually **a few seconds** (several HTTPS round-trips). Progress lines go to **stderr**; names print to **stdout**. If it stalls past **~2 minutes**, try `uv run calendar_digest.py --list-calendars -v` and check VPN/firewall/DNS. Each HTTP step uses bounded connect/read timeouts (not an infinite hang on the wire).
 6. `uv run calendar_digest.py --preview` and open `preview.html`.
 7. `uv run calendar_digest.py` to send the email.
 
@@ -27,7 +28,14 @@ Used to read calendars. **No** full Apple ID password in config—only an **app-
    - **`icloud.username`**: your Apple ID email (e.g. `you@icloud.com` or `you@gmail.com` if that is your Apple ID).
    - **`icloud.app_password`**: the app-specific password (including hyphens).
    - **`icloud.url`**: leave as `https://caldav.icloud.com` unless you know you need something else.
-5. Map **`icloud.calendars`**: keys must be the **exact** calendar names iCloud exposes. Run `uv run calendar_digest.py --list-calendars` after the above is set, then copy each name you want into the JSON keys. Values are short labels used in the email and AI prompt (e.g. `"Personal": "personal"`).
+5. Map **`icloud.calendars`**: keys must be the **exact** calendar names iCloud exposes. Run `uv run calendar_digest.py --list-calendars` after the above is set, then copy each name you want into the JSON keys. Values are short labels used in the email and AI prompt (e.g. `"Personal": "personal"`). Use **`--verbose`** (`-v`) with that command if you need CalDAV/HTTP debug logging.
+
+### How long should `--list-calendars` take?
+
+- **First time in a new environment** (`uv` cache empty or cold disk): importing `caldav` and XML libraries often takes **about 15–45 seconds** with no output yet. That is normal Python startup cost, not iCloud.
+- **After libraries load**: you should see **stderr** lines with elapsed seconds. Talking to Apple is usually **a few seconds** over a normal connection (principal lookup, then a single depth‑1 listing with a small PROPFIND).
+- **Fallback path**: if the light query returns no names, the tool runs Apple’s heavier calendar scan and warns on stderr; that can take **30–120 seconds** on accounts with many calendars.
+- **Not an infinite network hang**: each HTTPS call uses a **connect** and **read** timeout (roughly 12s / 55s for listing). If something still feels stuck, it is often **library import** (first line) or **CPU parsing a very large XML** response after download—use `--verbose` to see CalDAV traffic.
 
 ### SMTP (sending email)
 

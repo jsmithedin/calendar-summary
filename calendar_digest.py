@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-import caldav
 import requests
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
@@ -34,6 +33,30 @@ GEOCODE_CACHE_PATH = SCRIPT_DIR / "geocode_cache.json"
 PREVIEW_PATH = SCRIPT_DIR / "preview.html"
 DISPLAY_TZ = ZoneInfo("Europe/London")
 NOMINATIM_UA = "calendar-digest/1.0 (https://example.com/contact)"
+
+# caldav + lxml are heavy; load on first use so `--list-calendars` can print a hint first.
+_caldav_bundle: tuple[Any, Any, Any] | None = None
+
+
+def _load_caldav() -> tuple[Any, Any, Any]:
+    global _caldav_bundle
+    if _caldav_bundle is None:
+        import caldav as cd
+        from caldav.collection import (
+            _extract_calendar_home_set_from_results as ex_home,
+            _extract_calendars_from_propfind_results as ex_cals,
+        )
+
+        _caldav_bundle = (cd, ex_home, ex_cals)
+    return _caldav_bundle
+
+
+def _stderr_progress(msg: str, t0: float) -> None:
+    import sys
+
+    dt = time.monotonic() - t0
+    sys.stderr.write(f"calendar-digest [{dt:5.1f}s] {msg}\n")
+    sys.stderr.flush()
 WMO_DESCRIPTIONS: list[tuple[tuple[int, int], str]] = [
     ((0, 0), "clear sky"),
     ((1, 3), "partly cloudy"),
@@ -45,6 +68,12 @@ WMO_DESCRIPTIONS: list[tuple[tuple[int, int], str]] = [
     ((95, 99), "thunderstorm"),
 ]
 CALENDAR_COLORS = {"personal": "#2563eb", "family": "#059669", "runna": "#ea580c"}
+# Lighter than caldav's default list (drops getctag, calendar-color, etc.) — smaller iCloud responses.
+_CALENDAR_LIST_PROPS_MIN = (
+    "{DAV:}resourcetype",
+    "{DAV:}displayname",
+)
+
 BRIEFING_SECTIONS = (
     "At a Glance",
     "Clashes & Watch Points",
@@ -55,13 +84,28 @@ BRIEFING_SECTIONS = (
 )
 
 
-def setup_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+def setup_logging(*, verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(levelname)s %(name)s %(message)s" if verbose else "%(levelname)s %(message)s"
+    logging.basicConfig(level=level, format=fmt, force=True)
 
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def caldav_client(cfg: dict[str, Any], *, timeout: float | tuple[float, float]) -> Any:
+    """CalDAV client: RFC6764 discovery off for explicit HTTPS URLs; HTTP connect/read timeouts."""
+    cd, _, _ = _load_caldav()
+    ic = cfg["icloud"]
+    return cd.DAVClient(
+        ic["url"],
+        username=ic["username"],
+        password=ic["app_password"],
+        enable_rfc6764=False,
+        timeout=timeout,
+    )
 
 
 def week_bounds_utc(now: datetime) -> tuple[datetime, datetime]:
@@ -195,7 +239,7 @@ def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
     icloud = cfg["icloud"]
     events: list[DigestEvent] = []
     try:
-        client = caldav.DAVClient(icloud["url"], username=icloud["username"], password=icloud["app_password"])
+        client = caldav_client(cfg, timeout=(15.0, 120.0))
         principal = client.principal()
         cals = principal.calendars()
     except Exception as e:  # noqa: BLE001
@@ -232,14 +276,58 @@ def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
 
 
 def list_icloud_calendars(cfg: dict[str, Any]) -> None:
-    icloud = cfg["icloud"]
+    """List calendar display names with minimal PROPFIND payload (faster on iCloud than full caldav list)."""
+    t0 = time.monotonic()
+    import sys
+
+    sys.stderr.write(
+        "calendar-digest: loading CalDAV/XML libraries (first time in a new environment "
+        "often takes 15–45s; you will then see timed steps below).\n"
+    )
+    sys.stderr.flush()
+    _, _extract_cal_home, _extract_calendars = _load_caldav()
+    _stderr_progress("libraries ready; opening HTTPS session to iCloud…", t0)
+
     try:
-        client = caldav.DAVClient(icloud["url"], username=icloud["username"], password=icloud["app_password"])
+        # (connect, read) — avoid hanging indefinitely on dead routes or huge responses.
+        client = caldav_client(cfg, timeout=(12.0, 55.0))
+        _stderr_progress("fetching current-user-principal…", t0)
         principal = client.principal()
-        for c in principal.calendars():
-            n = getattr(c, "name", None)
-            if n:
-                print(n)
+        _stderr_progress(f"principal resolved; locating calendar home… ({principal.url})", t0)
+        home: str | None = None
+        try:
+            r1 = client.propfind(str(principal.url), props=client.CALENDAR_HOME_SET_PROPS, depth=0)
+            home = _extract_cal_home(r1.results)
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("Minimal calendar-home PROPFIND failed, falling back: %s", e)
+
+        names: list[str] = []
+        if home:
+            home = client._make_absolute_url(home)
+            try:
+                _stderr_progress("fetching calendar list (light PROPFIND)…", t0)
+                r2 = client.propfind(home, props=list(_CALENDAR_LIST_PROPS_MIN), depth=1)
+                for info in _extract_calendars(r2.results):
+                    label = (info.name or "").strip() or (info.cal_id or "").strip()
+                    if label:
+                        names.append(label)
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("Minimal calendar list PROPFIND failed, falling back: %s", e)
+                names = []
+
+        if not names:
+            _stderr_progress(
+                "light query returned no names; running full calendar scan (can take 30–120s on large accounts)…",
+                t0,
+            )
+            for c in principal.calendars():
+                n = getattr(c, "name", None)
+                if n:
+                    names.append(str(n).strip())
+
+        _stderr_progress(f"done; printing {len(set(names))} calendar name(s).\n", t0)
+        for n in sorted(set(names)):
+            print(n)
     except Exception as e:  # noqa: BLE001
         LOG.error("Failed to list calendars: %s", e)
         raise SystemExit(1) from e
@@ -731,11 +819,17 @@ def run_digest(cfg: dict[str, Any], preview: bool) -> None:
 
 
 def main() -> None:
-    setup_logging()
     p = argparse.ArgumentParser(description="iCloud calendar weekly digest")
     p.add_argument("--preview", action="store_true", help="Write preview.html instead of emailing")
     p.add_argument("--list-calendars", action="store_true", help="Print iCloud calendar names")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="DEBUG logging (includes caldav HTTP details; use with --list-calendars when diagnosing)",
+    )
     args = p.parse_args()
+    setup_logging(verbose=args.verbose)
 
     if not CONFIG_PATH.exists():
         LOG.error("Missing %s — copy config.example.json", CONFIG_PATH)
