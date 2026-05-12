@@ -1,0 +1,36 @@
+{
+  "icloud": {
+    "username": "user@icloud.com",
+    "app_password": "xxxx-xxxx-xxxx-xxxx",
+    "url": "https://caldav.icloud.com",
+    "calendars": {
+      "Personal": "personal",
+      "Family": "family",
+      "Runna": "runna"
+    }
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "username": "user@gmail.com",
+    "password": "gmail-app-password"
+  },
+  "email": {
+    "from": "user@gmail.com",
+    "to": "user@gmail.com"
+  },
+  "anthropic_api_key": "sk-ant-...",
+  "ai_summary_enabled": true,
+  "weather": {
+    "enabled": true,
+    "latitude": 55.9533,
+    "longitude": -3.1883,
+    "location_name": "Edinburgh"
+  },
+  "travel": {
+    "enabled": true,
+    "default_speed_kmh": 45,
+    "buffer_mins": 10
+  },
+  "context": "I live in Edinburgh. I work as a principal software engineer at a consulting firm. I mostly work from home and occasionally travel to client sites. I use Personal for my own appointments, Family is shared with my partner, and Runna holds my structured running training plan (sessions and paces). I run outdoors regularly; tie weather to those sessions when it helps."
+}

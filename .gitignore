@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Calendar digest local secrets and cache
+config.json
+geocode_cache.json
+preview.html

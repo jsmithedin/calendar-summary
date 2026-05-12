@@ -1,0 +1,22 @@
+[project]
+name = "calendar-digest"
+version = "1.0.0"
+description = "Weekly calendar digest with AI briefing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "caldav>=1.3",
+    "icalendar>=5.0",
+    "anthropic>=0.40",
+    "requests>=2.28",
+]
+
+[project.scripts]
+calendar-digest = "calendar_digest:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["calendar_digest"]
