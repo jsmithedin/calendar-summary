@@ -127,9 +127,10 @@ def _disable_http3_on_caldav_client(client: Any) -> None:
             proxy_kwargs["disabled_svn"] = disabled
             return super().proxy_manager_for(proxy, **proxy_kwargs)
 
-    adapter = _NoHttp3Adapter()
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    # Only replace the HTTPS adapter. Sharing one adapter for both http:// and https://
+    # (or mixing OCSP over HTTP with CalDAV on the same PoolManager) can trigger urllib3
+    # futures bugs where get_response sees the wrong object (e.g. no .extension).
+    session.mount("https://", _NoHttp3Adapter())
 
 
 def caldav_client(cfg: dict[str, Any], *, timeout: float | tuple[float, float]) -> Any:
