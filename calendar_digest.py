@@ -510,6 +510,25 @@ def list_icloud_calendars(cfg: dict[str, Any]) -> None:
         raise SystemExit(1) from e
 
 
+def list_google_calendars(cfg: dict[str, Any]) -> None:
+    try:
+        svc = _google_calendar_service(cfg)
+        names: list[str] = []
+        page_token: str | None = None
+        while True:
+            resp = svc.calendarList().list(pageToken=page_token).execute()
+            for item in resp.get("items", []):
+                names.append(item["summary"])
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        for n in sorted(set(names)):
+            print(n)
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Failed to list Google calendars: %s", e)
+        raise SystemExit(1) from e
+
+
 def fetch_weather(cfg: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]] | None]:
     w = cfg.get("weather") or {}
     if not w.get("enabled", True):
@@ -999,6 +1018,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="iCloud calendar weekly digest")
     p.add_argument("--preview", action="store_true", help="Write preview.html instead of emailing")
     p.add_argument("--list-calendars", action="store_true", help="Print iCloud calendar names")
+    p.add_argument("--list-google-calendars", action="store_true", help="Print Google calendar names")
     p.add_argument(
         "--verbose",
         "-v",
@@ -1015,6 +1035,10 @@ def main() -> None:
 
     if args.list_calendars:
         list_icloud_calendars(cfg)
+        return
+
+    if args.list_google_calendars:
+        list_google_calendars(cfg)
         return
 
     run_digest(cfg, preview=args.preview)
