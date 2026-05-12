@@ -322,6 +322,39 @@ def parse_vevent(component: IEvent, calendar_label: str) -> DigestEvent | None:
         return None
 
 
+def _parse_google_event(item: dict[str, Any], calendar_label: str) -> DigestEvent | None:
+    try:
+        title = item.get("summary", "(no title)")
+        location = item.get("location", "")
+        start_info = item.get("start", {})
+        end_info = item.get("end", {})
+        if "date" in start_info:
+            start_d = date.fromisoformat(start_info["date"])
+            start = datetime.combine(start_d, dt_time.min, tzinfo=timezone.utc)
+            end_d = date.fromisoformat(end_info.get("date", start_info["date"]))
+            end = datetime.combine(end_d, dt_time.min, tzinfo=timezone.utc) - timedelta(seconds=1)
+            all_day = True
+        else:
+            start = datetime.fromisoformat(start_info["dateTime"]).astimezone(timezone.utc)
+            end = datetime.fromisoformat(
+                end_info.get("dateTime", start_info["dateTime"])
+            ).astimezone(timezone.utc)
+            all_day = False
+        return DigestEvent(
+            title=title,
+            start=start,
+            end=end,
+            location=location,
+            calendar_label=calendar_label,
+            all_day=all_day,
+            lat=None,
+            lon=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("Skipping Google event parse failure: %s", e)
+        return None
+
+
 def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> list[DigestEvent]:
     icloud = cfg["icloud"]
     events: list[DigestEvent] = []
@@ -360,6 +393,58 @@ def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
 
     events.sort(key=lambda e: (e.start, e.end, e.title))
     return events
+
+
+def fetch_google_events(cfg: dict[str, Any], start: datetime, end: datetime) -> list[DigestEvent]:
+    if not cfg.get("google"):
+        return []
+    try:
+        svc = _google_calendar_service(cfg)
+        cal_id_map: dict[str, str] = {}
+        page_token: str | None = None
+        while True:
+            resp = svc.calendarList().list(pageToken=page_token).execute()
+            for item in resp.get("items", []):
+                cal_id_map[item["summary"]] = item["id"]
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        time_min = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_max = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        events: list[DigestEvent] = []
+
+        for name, label in cfg["google"]["calendars"].items():
+            cal_id = cal_id_map.get(name)
+            if not cal_id:
+                LOG.warning(
+                    "Google calendar not found: %r. Available: %s",
+                    name,
+                    sorted(cal_id_map),
+                )
+                continue
+            page_token = None
+            while True:
+                resp = svc.events().list(
+                    calendarId=cal_id,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    pageToken=page_token,
+                ).execute()
+                for item in resp.get("items", []):
+                    de = _parse_google_event(item, label)
+                    if de and de.start < end and de.end > start:
+                        events.append(de)
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+
+        return events
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Google Calendar fetch failed: %s", e)
+        return []
 
 
 def list_icloud_calendars(cfg: dict[str, Any]) -> None:
