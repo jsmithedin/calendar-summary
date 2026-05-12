@@ -9,6 +9,13 @@
       "Runna": "runna"
     }
   },
+  "google": {
+    "service_account_file": "google-service-account.json",
+    "impersonate": "you@yourworkspace.com",
+    "calendars": {
+      "Work": "work"
+    }
+  },
   "smtp": {
     "host": "smtp.gmail.com",
     "port": 587,
