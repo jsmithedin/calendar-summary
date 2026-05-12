@@ -95,17 +95,56 @@ def load_config(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _disable_http3_on_caldav_client(client: Any) -> None:
+    """Force TCP TLS for CalDAV (HTTP/1.1 or HTTP/2), not HTTP/3 over QUIC.
+
+    urllib3 2.2+ may upgrade via Alt-Svc after the first response. iCloud advertises
+    HTTP/3; the QUIC handshake often stalls (loss/retransmit loops) on some networks,
+    especially right after a 401 + connection reset.
+    """
+    try:
+        from urllib3.backend import HttpVersion
+        from requests.adapters import HTTPAdapter
+    except ImportError:
+        return
+
+    session = getattr(client, "session", None)
+    if session is None:
+        return
+
+    class _NoHttp3Adapter(HTTPAdapter):
+        def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+            pool_kwargs = dict(pool_kwargs)
+            disabled = set(pool_kwargs.get("disabled_svn") or ())
+            disabled.add(HttpVersion.h3)
+            pool_kwargs["disabled_svn"] = disabled
+            super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            proxy_kwargs = dict(proxy_kwargs)
+            disabled = set(proxy_kwargs.get("disabled_svn") or ())
+            disabled.add(HttpVersion.h3)
+            proxy_kwargs["disabled_svn"] = disabled
+            return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    adapter = _NoHttp3Adapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
 def caldav_client(cfg: dict[str, Any], *, timeout: float | tuple[float, float]) -> Any:
     """CalDAV client: RFC6764 discovery off for explicit HTTPS URLs; HTTP connect/read timeouts."""
     cd, _, _ = _load_caldav()
     ic = cfg["icloud"]
-    return cd.DAVClient(
+    client = cd.DAVClient(
         ic["url"],
         username=ic["username"],
         password=ic["app_password"],
         enable_rfc6764=False,
         timeout=timeout,
     )
+    _disable_http3_on_caldav_client(client)
+    return client
 
 
 def week_bounds_utc(now: datetime) -> tuple[datetime, datetime]:
