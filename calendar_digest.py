@@ -33,6 +33,8 @@ GEOCODE_CACHE_PATH = SCRIPT_DIR / "geocode_cache.json"
 PREVIEW_PATH = SCRIPT_DIR / "preview.html"
 DISPLAY_TZ = ZoneInfo("Europe/London")
 NOMINATIM_UA = "calendar-digest/1.0 (https://example.com/contact)"
+_GOOGLE_CAL_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+_GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 # caldav + lxml are heavy; load on first use so `--list-calendars` can print a hint first.
 _caldav_bundle: tuple[Any, Any, Any] | None = None
@@ -49,6 +51,42 @@ def _load_caldav() -> tuple[Any, Any, Any]:
 
         _caldav_bundle = (cd, ex_home, ex_cals)
     return _caldav_bundle
+
+
+_google_bundle: tuple[Any, Any] | None = None
+
+
+def _load_google() -> tuple[Any, Any]:
+    global _google_bundle
+    if _google_bundle is None:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        _google_bundle = (build, service_account)
+    return _google_bundle
+
+
+def _google_calendar_service(cfg: dict[str, Any]) -> Any:
+    build, service_account = _load_google()
+    g = cfg["google"]
+    sa_path = Path(g["service_account_file"])
+    if not sa_path.is_absolute():
+        sa_path = SCRIPT_DIR / sa_path
+    creds = service_account.Credentials.from_service_account_file(
+        str(sa_path), scopes=[_GOOGLE_CAL_SCOPE]
+    ).with_subject(g["impersonate"])
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def _google_gmail_service(cfg: dict[str, Any]) -> Any:
+    build, service_account = _load_google()
+    g = cfg["google"]
+    sa_path = Path(g["service_account_file"])
+    if not sa_path.is_absolute():
+        sa_path = SCRIPT_DIR / sa_path
+    creds = service_account.Credentials.from_service_account_file(
+        str(sa_path), scopes=[_GOOGLE_GMAIL_SCOPE]
+    ).with_subject(g["impersonate"])
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 def _stderr_progress(msg: str, t0: float) -> None:
@@ -98,39 +136,48 @@ def load_config(path: Path) -> dict[str, Any]:
 def _disable_http3_on_caldav_client(client: Any) -> None:
     """Force TCP TLS for CalDAV (HTTP/1.1 or HTTP/2), not HTTP/3 over QUIC.
 
-    urllib3 2.2+ may upgrade via Alt-Svc after the first response. iCloud advertises
-    HTTP/3; the QUIC handshake often stalls (loss/retransmit loops) on some networks,
-    especially right after a 401 + connection reset.
+    caldav uses niquests (an HTTP/3-capable requests fork backed by urllib3-future).
+    iCloud advertises HTTP/3 via Alt-Svc; the QUIC handshake can stall on some
+    networks. We subclass niquests' own HTTPAdapter so response objects stay
+    compatible with niquests' internals (avoids 'no .extension' AttributeError on
+    401 retries that occurs when a requests.HTTPAdapter is mounted on a niquests
+    session by mistake).
     """
-    try:
-        from urllib3.backend import HttpVersion
-        from requests.adapters import HTTPAdapter
-    except ImportError:
-        return
-
     session = getattr(client, "session", None)
     if session is None:
         return
 
-    class _NoHttp3Adapter(HTTPAdapter):
-        def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-            pool_kwargs = dict(pool_kwargs)
-            disabled = set(pool_kwargs.get("disabled_svn") or ())
-            disabled.add(HttpVersion.h3)
-            pool_kwargs["disabled_svn"] = disabled
-            super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+    try:
+        from niquests.adapters import HTTPAdapter as NiquestsHTTPAdapter
+        from niquests.adapters import HttpVersion
 
-        def proxy_manager_for(self, proxy, **proxy_kwargs):
-            proxy_kwargs = dict(proxy_kwargs)
-            disabled = set(proxy_kwargs.get("disabled_svn") or ())
-            disabled.add(HttpVersion.h3)
-            proxy_kwargs["disabled_svn"] = disabled
-            return super().proxy_manager_for(proxy, **proxy_kwargs)
+        class _NoHttp3Adapter(NiquestsHTTPAdapter):
+            def init_poolmanager(self, connections, maxsize, block=False, quic_cache_layer=None, **pool_kwargs):
+                pool_kwargs = dict(pool_kwargs)
+                disabled = set(pool_kwargs.get("disabled_svn") or ())
+                disabled.add(HttpVersion.h3)
+                pool_kwargs["disabled_svn"] = disabled
+                super().init_poolmanager(connections, maxsize, block=block, quic_cache_layer=None, **pool_kwargs)
 
-    # Only replace the HTTPS adapter. Sharing one adapter for both http:// and https://
-    # (or mixing OCSP over HTTP with CalDAV on the same PoolManager) can trigger urllib3
-    # futures bugs where get_response sees the wrong object (e.g. no .extension).
-    session.mount("https://", _NoHttp3Adapter())
+        session.mount("https://", _NoHttp3Adapter())
+    except ImportError:
+        # niquests not available; fall back to urllib3-future approach for
+        # requests-based sessions.
+        try:
+            from urllib3.backend import HttpVersion
+            from requests.adapters import HTTPAdapter
+
+            class _NoHttp3AdapterRequests(HTTPAdapter):
+                def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+                    pool_kwargs = dict(pool_kwargs)
+                    disabled = set(pool_kwargs.get("disabled_svn") or ())
+                    disabled.add(HttpVersion.h3)
+                    pool_kwargs["disabled_svn"] = disabled
+                    super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+            session.mount("https://", _NoHttp3AdapterRequests())
+        except ImportError:
+            pass
 
 
 def caldav_client(cfg: dict[str, Any], *, timeout: float | tuple[float, float]) -> Any:
