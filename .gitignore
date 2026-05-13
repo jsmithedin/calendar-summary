@@ -221,3 +221,4 @@ __marimo__/
 config.json
 geocode_cache.json
 preview.html
+google-service-account.json

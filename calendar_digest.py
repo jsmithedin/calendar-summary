@@ -33,6 +33,8 @@ GEOCODE_CACHE_PATH = SCRIPT_DIR / "geocode_cache.json"
 PREVIEW_PATH = SCRIPT_DIR / "preview.html"
 DISPLAY_TZ = ZoneInfo("Europe/London")
 NOMINATIM_UA = "calendar-digest/1.0 (https://example.com/contact)"
+_GOOGLE_CAL_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+_GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 # caldav + lxml are heavy; load on first use so `--list-calendars` can print a hint first.
 _caldav_bundle: tuple[Any, Any, Any] | None = None
@@ -49,6 +51,39 @@ def _load_caldav() -> tuple[Any, Any, Any]:
 
         _caldav_bundle = (cd, ex_home, ex_cals)
     return _caldav_bundle
+
+
+_google_bundle: tuple[Any, Any] | None = None
+
+
+def _load_google() -> tuple[Any, Any]:
+    global _google_bundle
+    if _google_bundle is None:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        _google_bundle = (build, service_account)
+    return _google_bundle
+
+
+def _google_creds(cfg: dict[str, Any], scope: str) -> Any:
+    _, service_account = _load_google()
+    g = cfg["google"]
+    sa_path = Path(g["service_account_file"])
+    if not sa_path.is_absolute():
+        sa_path = SCRIPT_DIR / sa_path
+    return service_account.Credentials.from_service_account_file(
+        str(sa_path), scopes=[scope]
+    ).with_subject(g["impersonate"])
+
+
+def _google_calendar_service(cfg: dict[str, Any]) -> Any:
+    build, _ = _load_google()
+    return build("calendar", "v3", credentials=_google_creds(cfg, _GOOGLE_CAL_SCOPE), cache_discovery=False)
+
+
+def _google_gmail_service(cfg: dict[str, Any]) -> Any:
+    build, _ = _load_google()
+    return build("gmail", "v1", credentials=_google_creds(cfg, _GOOGLE_GMAIL_SCOPE), cache_discovery=False)
 
 
 def _stderr_progress(msg: str, t0: float) -> None:
@@ -98,39 +133,48 @@ def load_config(path: Path) -> dict[str, Any]:
 def _disable_http3_on_caldav_client(client: Any) -> None:
     """Force TCP TLS for CalDAV (HTTP/1.1 or HTTP/2), not HTTP/3 over QUIC.
 
-    urllib3 2.2+ may upgrade via Alt-Svc after the first response. iCloud advertises
-    HTTP/3; the QUIC handshake often stalls (loss/retransmit loops) on some networks,
-    especially right after a 401 + connection reset.
+    caldav uses niquests (an HTTP/3-capable requests fork backed by urllib3-future).
+    iCloud advertises HTTP/3 via Alt-Svc; the QUIC handshake can stall on some
+    networks. We subclass niquests' own HTTPAdapter so response objects stay
+    compatible with niquests' internals (avoids 'no .extension' AttributeError on
+    401 retries that occurs when a requests.HTTPAdapter is mounted on a niquests
+    session by mistake).
     """
-    try:
-        from urllib3.backend import HttpVersion
-        from requests.adapters import HTTPAdapter
-    except ImportError:
-        return
-
     session = getattr(client, "session", None)
     if session is None:
         return
 
-    class _NoHttp3Adapter(HTTPAdapter):
-        def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-            pool_kwargs = dict(pool_kwargs)
-            disabled = set(pool_kwargs.get("disabled_svn") or ())
-            disabled.add(HttpVersion.h3)
-            pool_kwargs["disabled_svn"] = disabled
-            super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+    try:
+        from niquests.adapters import HTTPAdapter as NiquestsHTTPAdapter
+        from niquests.adapters import HttpVersion
 
-        def proxy_manager_for(self, proxy, **proxy_kwargs):
-            proxy_kwargs = dict(proxy_kwargs)
-            disabled = set(proxy_kwargs.get("disabled_svn") or ())
-            disabled.add(HttpVersion.h3)
-            proxy_kwargs["disabled_svn"] = disabled
-            return super().proxy_manager_for(proxy, **proxy_kwargs)
+        class _NoHttp3Adapter(NiquestsHTTPAdapter):
+            def init_poolmanager(self, connections, maxsize, block=False, quic_cache_layer=None, **pool_kwargs):
+                pool_kwargs = dict(pool_kwargs)
+                disabled = set(pool_kwargs.get("disabled_svn") or ())
+                disabled.add(HttpVersion.h3)
+                pool_kwargs["disabled_svn"] = disabled
+                super().init_poolmanager(connections, maxsize, block=block, quic_cache_layer=None, **pool_kwargs)
 
-    # Only replace the HTTPS adapter. Sharing one adapter for both http:// and https://
-    # (or mixing OCSP over HTTP with CalDAV on the same PoolManager) can trigger urllib3
-    # futures bugs where get_response sees the wrong object (e.g. no .extension).
-    session.mount("https://", _NoHttp3Adapter())
+        session.mount("https://", _NoHttp3Adapter())
+    except ImportError:
+        # niquests not available; fall back to urllib3-future approach for
+        # requests-based sessions.
+        try:
+            from urllib3.backend import HttpVersion
+            from requests.adapters import HTTPAdapter
+
+            class _NoHttp3AdapterRequests(HTTPAdapter):
+                def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+                    pool_kwargs = dict(pool_kwargs)
+                    disabled = set(pool_kwargs.get("disabled_svn") or ())
+                    disabled.add(HttpVersion.h3)
+                    pool_kwargs["disabled_svn"] = disabled
+                    super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+            session.mount("https://", _NoHttp3AdapterRequests())
+        except ImportError:
+            pass
 
 
 def caldav_client(cfg: dict[str, Any], *, timeout: float | tuple[float, float]) -> Any:
@@ -275,7 +319,46 @@ def parse_vevent(component: IEvent, calendar_label: str) -> DigestEvent | None:
         return None
 
 
+def _parse_google_event(item: dict[str, Any], calendar_label: str) -> DigestEvent | None:
+    try:
+        if item.get("status") == "cancelled":
+            return None
+        title = item.get("summary", "(no title)")
+        location = item.get("location", "")
+        start_info = item.get("start", {})
+        if not start_info:
+            return None
+        end_info = item.get("end", {})
+        if "date" in start_info:
+            start_d = date.fromisoformat(start_info["date"])
+            start = datetime.combine(start_d, dt_time.min, tzinfo=timezone.utc)
+            end_d = date.fromisoformat(end_info.get("date", start_info["date"]))
+            end = datetime.combine(end_d, dt_time.min, tzinfo=timezone.utc) - timedelta(seconds=1)
+            all_day = True
+        else:
+            start = datetime.fromisoformat(start_info["dateTime"]).astimezone(timezone.utc)
+            end = datetime.fromisoformat(
+                end_info.get("dateTime", start_info["dateTime"])
+            ).astimezone(timezone.utc)
+            all_day = False
+        return DigestEvent(
+            title=title,
+            start=start,
+            end=end,
+            location=location,
+            calendar_label=calendar_label,
+            all_day=all_day,
+            lat=None,
+            lon=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("Skipping Google event parse failure: %s", e)
+        return None
+
+
 def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> list[DigestEvent]:
+    if not cfg.get("icloud"):
+        return []
     icloud = cfg["icloud"]
     events: list[DigestEvent] = []
     try:
@@ -313,6 +396,59 @@ def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
 
     events.sort(key=lambda e: (e.start, e.end, e.title))
     return events
+
+
+def fetch_google_events(cfg: dict[str, Any], start: datetime, end: datetime) -> list[DigestEvent]:
+    if not cfg.get("google"):
+        return []
+    try:
+        svc = _google_calendar_service(cfg)
+        cal_id_map: dict[str, str] = {}
+        page_token: str | None = None
+        while True:
+            resp = svc.calendarList().list(pageToken=page_token).execute()
+            for item in resp.get("items", []):
+                cal_id_map[item["summary"]] = item["id"]
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        time_min = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_max = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        events: list[DigestEvent] = []
+
+        for name, label in cfg["google"]["calendars"].items():
+            cal_id = cal_id_map.get(name)
+            if not cal_id:
+                LOG.warning(
+                    "Google calendar not found: %r. Available: %s",
+                    name,
+                    sorted(cal_id_map),
+                )
+                continue
+            page_token = None
+            while True:
+                resp = svc.events().list(
+                    calendarId=cal_id,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    pageToken=page_token,
+                ).execute()
+                for item in resp.get("items", []):
+                    de = _parse_google_event(item, label)
+                    if de and de.start < end and de.end > start:
+                        events.append(de)
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+
+        events.sort(key=lambda e: (e.start, e.end, e.title))
+        return events
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Google Calendar fetch failed: %s", e)
+        return []
 
 
 def list_icloud_calendars(cfg: dict[str, Any]) -> None:
@@ -370,6 +506,25 @@ def list_icloud_calendars(cfg: dict[str, Any]) -> None:
             print(n)
     except Exception as e:  # noqa: BLE001
         LOG.error("Failed to list calendars: %s", e)
+        raise SystemExit(1) from e
+
+
+def list_google_calendars(cfg: dict[str, Any]) -> None:
+    try:
+        svc = _google_calendar_service(cfg)
+        names: list[str] = []
+        page_token: str | None = None
+        while True:
+            resp = svc.calendarList().list(pageToken=page_token).execute()
+            for item in resp.get("items", []):
+                names.append(item["summary"])
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        for n in sorted(set(names)):
+            print(n)
+    except Exception as e:  # noqa: BLE001
+        LOG.error("Failed to list Google calendars: %s", e)
         raise SystemExit(1) from e
 
 
@@ -789,6 +944,13 @@ def render_html(
 
 
 def send_html_email(cfg: dict[str, Any], subject: str, html: str) -> None:
+    if cfg.get("google"):
+        _send_gmail_api(cfg, subject, html)
+    else:
+        _send_smtp(cfg, subject, html)
+
+
+def _send_smtp(cfg: dict[str, Any], subject: str, html: str) -> None:
     smtp_cfg = cfg["smtp"]
     em = cfg["email"]
     msg = MIMEMultipart("alternative")
@@ -800,6 +962,19 @@ def send_html_email(cfg: dict[str, Any], subject: str, html: str) -> None:
         s.starttls()
         s.login(smtp_cfg["username"], smtp_cfg["password"])
         s.sendmail(em["from"], [em["to"]], msg.as_string())
+
+
+def _send_gmail_api(cfg: dict[str, Any], subject: str, html: str) -> None:
+    import base64
+    em = cfg["email"]
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = em["from"]
+    msg["To"] = em["to"]
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    svc = _google_gmail_service(cfg)
+    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def subject_for(week_start: datetime, include_month: bool) -> str:
@@ -814,10 +989,18 @@ def run_digest(cfg: dict[str, Any], preview: bool) -> None:
     week_start, week_end = week_bounds_utc(now)
     first_sun = is_first_sunday(now.astimezone(DISPLAY_TZ))
 
-    week_events = fetch_icloud_events(cfg, week_start, week_end)
+    week_events = (
+        fetch_icloud_events(cfg, week_start, week_end)
+        + fetch_google_events(cfg, week_start, week_end)
+    )
+    week_events.sort(key=lambda e: (e.start, e.end, e.title))
     month_events: list[DigestEvent] = []
     if first_sun:
-        month_events = fetch_icloud_events(cfg, week_end, week_end + timedelta(days=30))
+        month_events = (
+            fetch_icloud_events(cfg, week_end, week_end + timedelta(days=30))
+            + fetch_google_events(cfg, week_end, week_end + timedelta(days=30))
+        )
+        month_events.sort(key=lambda e: (e.start, e.end, e.title))
 
     travel_cfg = cfg.get("travel") or {}
     travel_on = travel_cfg.get("enabled", True)
@@ -862,6 +1045,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="iCloud calendar weekly digest")
     p.add_argument("--preview", action="store_true", help="Write preview.html instead of emailing")
     p.add_argument("--list-calendars", action="store_true", help="Print iCloud calendar names")
+    p.add_argument("--list-google-calendars", action="store_true", help="Print Google calendar names")
     p.add_argument(
         "--verbose",
         "-v",
@@ -878,6 +1062,10 @@ def main() -> None:
 
     if args.list_calendars:
         list_icloud_calendars(cfg)
+        return
+
+    if args.list_google_calendars:
+        list_google_calendars(cfg)
         return
 
     run_digest(cfg, preview=args.preview)

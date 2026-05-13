@@ -47,6 +47,69 @@ The digest is sent over **SMTP with STARTTLS** (typically port **587**).
 
 If you use another provider, set **`smtp.host`**, **`smtp.port`**, **`smtp.username`**, and **`smtp.password`** to that provider’s documented values (still STARTTLS on 587 in most cases).
 
+### Google Calendar + Gmail (optional, Google Workspace)
+
+Replaces SMTP sending and adds Google Calendar as a second event source. Both use a single **service account with domain-wide delegation (DWD)** — no browser flow, no token expiry.
+
+#### 1. Create a Google Cloud project and enable APIs
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com/) and create a new project (or reuse one).
+2. Enable the **Google Calendar API**: APIs & Services → Library → search "Google Calendar API" → Enable.
+3. Enable the **Gmail API**: same path → search "Gmail API" → Enable.
+
+#### 2. Create a service account and download the key
+
+1. APIs & Services → Credentials → Create Credentials → Service account.
+2. Give it any name (e.g. `calendar-digest`). No special roles needed. Click Done.
+3. Click the service account → Keys tab → Add Key → Create new key → JSON → Create.
+4. Save the downloaded `.json` file into this repository directory (it is gitignored by name as `google-service-account.json` — verify with `git status`). Name it `google-service-account.json` or update `service_account_file` in `config.json` and add the new filename to `.gitignore` manually.
+
+#### 3. Grant domain-wide delegation in Workspace Admin
+
+1. Open the service account in Google Cloud Console and copy its **client ID** (a long number under "OAuth 2 Client ID").
+2. Sign into [admin.google.com](https://admin.google.com/) as a Workspace admin.
+3. Go to **Security → Access and data control → API controls → Manage Domain Wide Delegation**.
+4. Click **Add new** and enter:
+   - **Client ID**: the number from step 1
+   - **OAuth scopes**: `https://www.googleapis.com/auth/calendar.readonly,https://www.googleapis.com/auth/gmail.send`
+5. Click Authorise.
+
+#### 4. Configure `config.json`
+
+Add the `google` block:
+
+```json
+"google": {
+  "service_account_file": "google-service-account.json",
+  "impersonate": "you@yourworkspace.com",
+  "calendars": {
+    "Work": "work"
+  }
+}
+```
+
+- **`service_account_file`**: path relative to the script directory, or absolute.
+- **`impersonate`**: your Workspace email address — the service account acts as you.
+- **`calendars`**: populated in the next step.
+
+Once `google` is present, the `smtp` block is optional — Gmail API is used for sending instead.
+
+#### 5. Discover your Google calendar names
+
+```bash
+uv run calendar_digest.py --list-google-calendars
+```
+
+Copy the names you want into `config.google.calendars` (keys are exact display names, values are short labels used in the email and AI prompt).
+
+#### 6. Test
+
+```bash
+uv run calendar_digest.py --preview
+```
+
+Open `preview.html` to confirm Google Calendar events appear alongside iCloud events.
+
 ### Anthropic (optional AI briefing)
 
 Used only when **`ai_summary_enabled`** is `true`.
