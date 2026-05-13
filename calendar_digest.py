@@ -357,6 +357,8 @@ def _parse_google_event(item: dict[str, Any], calendar_label: str) -> DigestEven
 
 
 def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> list[DigestEvent]:
+    if not cfg.get("icloud"):
+        return []
     icloud = cfg["icloud"]
     events: list[DigestEvent] = []
     try:

@@ -62,7 +62,7 @@ Replaces SMTP sending and adds Google Calendar as a second event source. Both us
 1. APIs & Services → Credentials → Create Credentials → Service account.
 2. Give it any name (e.g. `calendar-digest`). No special roles needed. Click Done.
 3. Click the service account → Keys tab → Add Key → Create new key → JSON → Create.
-4. Save the downloaded `.json` file into this repository directory (it is gitignored via `*.json` — verify with `git status`). Name it `google-service-account.json` or update `service_account_file` in `config.json`.
+4. Save the downloaded `.json` file into this repository directory (it is gitignored by name as `google-service-account.json` — verify with `git status`). Name it `google-service-account.json` or update `service_account_file` in `config.json` and add the new filename to `.gitignore` manually.
 
 #### 3. Grant domain-wide delegation in Workspace Admin
 
