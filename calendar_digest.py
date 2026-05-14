@@ -640,10 +640,39 @@ def geocode_locations(events: list[DigestEvent], travel_enabled: bool, cache_pat
         save_geocode_cache(cache_path, cache)
 
 
+def geocode_single(address: str, cache_path: Path) -> tuple[float, float] | None:
+    cache = load_geocode_cache(cache_path)
+    if address in cache:
+        return cache[address]["lat"], cache[address]["lon"]
+    session = requests.Session()
+    session.headers["User-Agent"] = NOMINATIM_UA
+    try:
+        r = session.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": address, "format": "json", "limit": 1},
+            timeout=30,
+        )
+        r.raise_for_status()
+        arr = r.json()
+        time.sleep(1)
+        if not arr:
+            LOG.debug("Geocode miss for home address %r", address)
+            return None
+        lat, lon = float(arr[0]["lat"]), float(arr[0]["lon"])
+        cache[address] = {"lat": lat, "lon": lon}
+        save_geocode_cache(cache_path, cache)
+        return lat, lon
+    except Exception as e:  # noqa: BLE001
+        LOG.debug("Geocode error for home address %r: %s", address, e)
+        return None
+
+
 def compute_travel_segments(
     week_events: list[DigestEvent],
     speed_kmh: float,
     buffer_mins: int,
+    home_lat: float | None = None,
+    home_lon: float | None = None,
 ) -> list[TravelSegment]:
     segs: list[TravelSegment] = []
     by_day: dict[str, list[DigestEvent]] = {}
@@ -656,6 +685,23 @@ def compute_travel_segments(
         day_events.sort(key=lambda x: x.start)
         coords = [x for x in day_events if x.lat is not None and x.lon is not None]
         dlabel = date.fromisoformat(dk).strftime("%A %d %b")
+        if home_lat is not None and home_lon is not None and coords:
+            first = coords[0]
+            dist = haversine_km(home_lat, home_lon, first.lat, first.lon)
+            est = int(math.ceil((dist / speed_kmh) * 60)) if speed_kmh > 0 else 0
+            segs.append(TravelSegment(
+                from_event="Home",
+                to_event=first.title,
+                from_end_local="",
+                to_start_local=first.start.astimezone(DISPLAY_TZ).strftime("%H:%M"),
+                to_start=first.start,
+                distance_km=round(dist, 1),
+                estimated_mins=est,
+                gap_mins=0,
+                is_tight=False,
+                day_key=dlabel,
+                to_location=first.location,
+            ))
         for a, b in zip(coords, coords[1:]):
             dist = haversine_km(a.lat, a.lon, b.lat, b.lon)
             est = int(math.ceil((dist / speed_kmh) * 60)) if speed_kmh > 0 else 0
@@ -711,15 +757,21 @@ def format_travel_block(segments: list[TravelSegment]) -> str:
     for day in sorted(by_day.keys()):
         lines.append(f"  {day}:")
         for s in by_day[day]:
-            status = "TIGHT" if s.is_tight else "OK"
+            from_label = s.from_event if not s.from_end_local else f"{s.from_event} (ends {s.from_end_local})"
             lines.append(
-                f"    {s.from_event} (ends {s.from_end_local}) → {s.to_event} "
+                f"    {from_label} → {s.to_event} "
                 f"(starts {s.to_start_local}) @ {s.to_location}"
             )
-            lines.append(
-                f"      Distance: {s.distance_km}km, est. travel: {s.estimated_mins} mins, "
-                f"available gap: {s.gap_mins} mins — {status}"
-            )
+            if s.gap_mins > 0:
+                status = "TIGHT" if s.is_tight else "OK"
+                lines.append(
+                    f"      Distance: {s.distance_km}km, est. travel: {s.estimated_mins} mins, "
+                    f"available gap: {s.gap_mins} mins — {status}"
+                )
+            else:
+                lines.append(
+                    f"      Distance: {s.distance_km}km, est. travel: {s.estimated_mins} mins from home"
+                )
     return "\n".join(lines)
 
 
@@ -1051,10 +1103,16 @@ def run_digest(cfg: dict[str, Any], preview: bool) -> None:
     travel_on = travel_cfg.get("enabled", True)
     if travel_on:
         geocode_locations(week_events + month_events, True, GEOCODE_CACHE_PATH)
+        home_coords: tuple[float, float] | None = None
+        home_address = travel_cfg.get("home_address", "")
+        if home_address:
+            home_coords = geocode_single(home_address, GEOCODE_CACHE_PATH)
         segments = compute_travel_segments(
             week_events,
             float(travel_cfg.get("default_speed_kmh", 45)),
             int(travel_cfg.get("buffer_mins", 10)),
+            home_lat=home_coords[0] if home_coords else None,
+            home_lon=home_coords[1] if home_coords else None,
         )
     else:
         segments = []
