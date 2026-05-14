@@ -37,7 +37,8 @@
   "travel": {
     "enabled": true,
     "default_speed_kmh": 45,
-    "buffer_mins": 10
+    "buffer_mins": 10,
+    "home_address": "Your home address for travel-from-home calculations"
   },
   "context": "I live in Edinburgh. I work as a principal software engineer at a consulting firm. I mostly work from home and occasionally travel to client sites. I use Personal for my own appointments, Family is shared with my partner, and Runna holds my structured running training plan (sessions and paces). I run outdoors regularly; tie weather to those sessions when it helps."
 }
