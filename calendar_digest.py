@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import smtplib
 import time
 from dataclasses import dataclass
@@ -370,7 +371,7 @@ def fetch_icloud_events(cfg: dict[str, Any], start: datetime, end: datetime) -> 
         return []
 
     cal_map: dict[str, str] = icloud["calendars"]
-    by_name = {c.name: c for c in cals if getattr(c, "name", None)}
+    by_name = {c.get_display_name(): c for c in cals if c.get_display_name()}
     missing = [n for n in cal_map if n not in by_name]
     if missing:
         LOG.warning("Calendar(s) not found: %s. Available: %s", missing, sorted(by_name.keys()))
@@ -512,17 +513,18 @@ def list_icloud_calendars(cfg: dict[str, Any]) -> None:
 def list_google_calendars(cfg: dict[str, Any]) -> None:
     try:
         svc = _google_calendar_service(cfg)
-        names: list[str] = []
+        entries: list[tuple[str, str, bool]] = []
         page_token: str | None = None
         while True:
-            resp = svc.calendarList().list(pageToken=page_token).execute()
+            resp = svc.calendarList().list(pageToken=page_token, showHidden=True).execute()
             for item in resp.get("items", []):
-                names.append(item["summary"])
+                entries.append((item["summary"], item["id"], item.get("hidden", False)))
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
-        for n in sorted(set(names)):
-            print(n)
+        for summary, cal_id, hidden in sorted(set(entries)):
+            hidden_tag = "  [hidden]" if hidden else ""
+            print(f"{summary}{hidden_tag}\n  id: {cal_id}")
     except Exception as e:  # noqa: BLE001
         LOG.error("Failed to list Google calendars: %s", e)
         raise SystemExit(1) from e
@@ -728,8 +730,15 @@ def build_ai_prompt(
     weather_text: str | None,
     travel_text: str,
     include_month: bool,
+    now: datetime,
 ) -> str:
     parts: list[str] = []
+    parts.append("TODAY: " + now.astimezone(DISPLAY_TZ).strftime("%A %d %B %Y"))
+    icloud_labels = list((cfg.get("icloud") or {}).get("calendars", {}).values())
+    google_labels = list((cfg.get("google") or {}).get("calendars", {}).values())
+    all_labels = icloud_labels + google_labels
+    if all_labels:
+        parts.append("CALENDARS: " + ", ".join(all_labels))
     ctx = (cfg.get("context") or "").strip()
     if ctx:
         parts.append("CONTEXT:\n" + ctx)
@@ -750,18 +759,23 @@ def generate_briefing(cfg: dict[str, Any], user_prompt: str) -> str:
     if not key or Anthropic is None:
         LOG.warning("Anthropic API key missing or SDK not installed; skipping briefing")
         return ""
+    sections = "At a Glance; Clashes & Watch Points; Weather & Outdoors; Prep & Logistics; Patterns" + (
+        "; Month Outlook" if "MONTH AHEAD:" in user_prompt else ""
+    )
     system = (
-        "You are a concise executive assistant. Produce a calendar briefing for the reader as 'you'. "
-        "Use exactly these section titles on their own line, followed by one or two short paragraphs each: "
-        "At a Glance; Clashes & Watch Points; Weather & Outdoors; Prep & Logistics; Patterns"
-        + ("; Month Outlook" if "MONTH AHEAD:" in user_prompt else "")
-        + ". No bullet points or numbered lists. Under 400 words total. Direct tone."
+        "You are a concise executive assistant. Write a calendar briefing for the reader in second person ('you'). "
+        "Format using markdown: use `## Section Title` for each section heading, `**bold**` to highlight key items, "
+        "and bullet points (`-`) where lists are clearer than prose — especially in Prep & Logistics and Clashes & Watch Points. "
+        f"Use exactly these sections in order: {sections}. "
+        "Events are tagged with calendar labels — refer to them by name (e.g. 'your runna session', 'a family commitment') "
+        "rather than generic terms. "
+        "Under 500 words total. Direct, practical tone."
     )
     try:
         client = Anthropic(api_key=key)
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=600,
+            model="claude-sonnet-4-6",
+            max_tokens=800,
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -774,23 +788,54 @@ def generate_briefing(cfg: dict[str, Any], user_prompt: str) -> str:
         return ""
 
 
+def _md_inline(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+
+
 def format_briefing_html(text: str) -> str:
     if not text:
         return ""
-    paras: list[str] = []
+    parts: list[str] = []
     buf: list[str] = []
+    in_ul = False
+
+    def flush_para() -> None:
+        nonlocal in_ul
+        if in_ul:
+            parts.append("</ul>")
+            in_ul = False
+        if buf:
+            parts.append('<p style="margin:4px 0 8px">' + " ".join(buf) + "</p>")
+            buf.clear()
+
     for line in text.splitlines():
         line = line.strip()
-        if line in BRIEFING_SECTIONS and buf:
-            paras.append("<p>" + " ".join(buf) + "</p>")
-            buf = []
-        if line in BRIEFING_SECTIONS:
-            paras.append(f'<p style="margin:12px 0 4px;font-weight:bold;color:#92400e">{line}</p>')
-        elif line:
-            buf.append(line)
-    if buf:
-        paras.append("<p>" + " ".join(buf) + "</p>")
-    inner = "\n".join(paras)
+        if not line:
+            flush_para()
+            continue
+        if line.startswith("## "):
+            flush_para()
+            title = _md_inline(line[3:].strip())
+            parts.append(
+                f'<p style="margin:14px 0 4px;font-weight:bold;font-size:14px;color:#92400e;'
+                f'border-bottom:1px solid #f59e0b;padding-bottom:3px">{title}</p>'
+            )
+        elif line.startswith("- ") or line.startswith("* "):
+            if buf:
+                parts.append('<p style="margin:4px 0 8px">' + " ".join(buf) + "</p>")
+                buf.clear()
+            if not in_ul:
+                parts.append('<ul style="margin:4px 0 8px;padding-left:18px">')
+                in_ul = True
+            parts.append(f'<li style="margin-bottom:3px">{_md_inline(line[2:].strip())}</li>')
+        else:
+            if in_ul:
+                parts.append("</ul>")
+                in_ul = False
+            buf.append(_md_inline(line))
+
+    flush_para()
+    inner = "\n".join(parts)
     return (
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px">'
         '<tr><td style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:14px;color:#78350f">'
@@ -1017,7 +1062,7 @@ def run_digest(cfg: dict[str, Any], preview: bool) -> None:
     weather_text, weather_cells = fetch_weather(cfg)
     travel_text = format_travel_block(segments) if travel_on else ""
 
-    prompt = build_ai_prompt(cfg, week_events, month_events, weather_text, travel_text, first_sun)
+    prompt = build_ai_prompt(cfg, week_events, month_events, weather_text, travel_text, first_sun, now)
     briefing = generate_briefing(cfg, prompt)
 
     html = render_html(
